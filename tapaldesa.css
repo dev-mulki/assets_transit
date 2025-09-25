@@ -66,12 +66,13 @@ html .content .content-wrapper .content-header-title {
 
 
 body {
-  font-family: "Inter", sans-serif !important;
+  font-family: "Roboto", sans-serif !important;
 }
 
 h1, h2, h3, h4, h5, h6,
 .h1, .h2, .h3, .h4, .h5, .h6 {
-  font-family: "Montserrat", sans-serif;
+  font-family: "Poppins", sans-serif;
+  color: var(--bs-body-color);
 }
 
 .navigation,
