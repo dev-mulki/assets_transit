@@ -10,10 +10,6 @@ html .content .content-wrapper .content-header-title {
   color: var(--bs-body-color);
 }
 
-h6, .h6, h5, .h5, h4, .h4, h3, .h3, h2, .h2, h1, .h1 {
-    color: var(--bs-body-color);
-}
-
 .react-dataTable
   .rdt_TableHead
   .rdt_TableHeadRow
@@ -68,14 +64,22 @@ h6, .h6, h5, .h5, h4, .h4, h3, .h3, h2, .h2, h1, .h1 {
   color: var(--bs-body-color);
 }
 
+
 body {
   font-family: "Roboto", sans-serif !important;
 }
 
+h1, h2, h3, h4, h5, h6,
+.h1, .h2, .h3, .h4, .h5, .h6 {
+  font-family: "Poppins", sans-serif;
+  color: var(--bs-body-color);
+}
+
 .navigation,
 .header-navbar {
-  font-family: inherit;
+  font-family: inherit; /* tetap ikut body (Roboto) */
 }
+
 
 .main-menu {
   background: #f8f8f8 !important;
