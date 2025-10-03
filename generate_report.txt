@@ -6,7 +6,7 @@ class GenerateGlobalReport(Resource):
         try:
             import os, io, subprocess, tempfile
             import openpyxl
-            from flask import send_file, current_app, request
+            from flask import send_file
             from openpyxl.styles import Font, Alignment, Border, Side
             
             args = parser.parse_args()
