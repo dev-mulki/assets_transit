@@ -4,11 +4,12 @@ class GenerateGlobalReport(Resource):
     @doc.getSummaryRespDoc
     def get(self):
         try:
-            import os, io, subprocess, tempfile
+            # === Local Import ===
+            import os, io, subprocess, tempfile, datetime
             import openpyxl
-            from flask import send_file
+            from flask import send_file, current_app, request
             from openpyxl.styles import Font, Alignment, Border, Side
-            
+
             args = parser.parse_args()
 
             # --- Lokasi template ---
@@ -45,24 +46,21 @@ class GenerateGlobalReport(Resource):
             params.update(body)
             params.pop("file_name", None)
 
-            # ---- Helper: safe_format (local function) ----
+            # ---- Helper: safe_format ----
             def safe_format(q, p):
                 class SafeDict(dict):
                     def __missing__(self, key):
-                        return "NULL"  # literal NULL
-
+                        return "NULL"
                     def __getitem__(self, key):
                         val = dict.get(self, key)
                         if val is None or str(val).lower() in ["none", "null", "undefined", ""]:
-                            return "NULL"  # pastikan NULL bukan 'NULL'
+                            return "NULL"
                         if isinstance(val, (int, float)):
                             return str(val)
                         safe_val = str(val).replace("'", "''")
                         return f"'{safe_val}'"
-
                 return q.format_map(SafeDict(p))
 
-            # ---- Format query aman ----
             query = safe_format(query, params)
             print(query)
 
@@ -79,7 +77,7 @@ class GenerateGlobalReport(Resource):
             if sheet_mapping["A2"].value and "start_col_from" in str(sheet_mapping["A2"].value):
                 start_col_from = int(sheet_mapping["B2"].value)
 
-            # ---- Baca mapping (mulai dari row 4) ----
+            # ---- Baca mapping ----
             mapping = []
             for row in sheet_mapping.iter_rows(min_row=4, values_only=True):
                 sheet_col, db_col, dtype, prefix, suffix, align, style, aggregate, wraptext = row + (None,) * (9 - len(row))
@@ -97,24 +95,62 @@ class GenerateGlobalReport(Resource):
                     "wraptext": str(wraptext).strip() in ["1", "true", "yes", "y"]
                 })
 
-            # ---- Merge vars: params + row pertama query ----
+            # ---- Merge vars ----
             data_first = data[0] if data else {}
             merged_vars = {**params, **data_first}
 
-            # ---- Replace placeholder di Output ----
+            # ---- Geser placeholder tanda tangan (_sign) dulu ----
+            sign_cells = []
+            for row in sheet_output.iter_rows(values_only=False):
+                for cell in row:
+                    if cell.value and isinstance(cell.value, str) and "_sign" in cell.value:
+                        sign_cells.append((cell.row, cell.column, cell.value, cell))
+
+            if sign_cells:
+                last_row = start_row_from + len(data) + 3
+                min_row = min(r for r, _, _, _ in sign_cells)
+
+                for r, c, val, old_cell in sign_cells:
+                    offset = r - min_row
+                    new_row = last_row + offset
+                    new_val = val.replace("_sign", "")
+
+                    # buat cell baru di bawah
+                    new_cell = sheet_output.cell(row=new_row, column=c, value=new_val)
+
+                    if old_cell.has_style:
+                        new_cell.font = Font(
+                            name=old_cell.font.name,
+                            size=old_cell.font.size,
+                            bold=old_cell.font.bold,
+                            italic=old_cell.font.italic,
+                            underline=old_cell.font.underline,
+                            color=old_cell.font.color
+                        )
+                        new_cell.alignment = Alignment(
+                            horizontal=old_cell.alignment.horizontal,
+                            vertical=old_cell.alignment.vertical
+                        )
+
+                    # === Reset tampilan cell lama jadi default tabel ===
+                    thin = Side(style="thin", color="000000")
+                    old_cell.value = None
+                    old_cell.font = Font(name="Calibri", size=11, color="000000", italic=False, bold=False)
+                    old_cell.alignment = Alignment(horizontal="center", vertical="center")
+                    old_cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+                    old_cell.fill = PatternFill(fill_type=None)
+            # ---- Replace semua placeholder (termasuk hasil geser) ----
             for row in sheet_output.iter_rows(values_only=False):
                 for cell in row:
                     if cell.value and isinstance(cell.value, str) and "{" in cell.value:
                         try:
                             cell.value = cell.value.format(**merged_vars)
                         except KeyError:
-                            cell.value = ""   # fallback kosong
+                            pass
                         except Exception:
                             pass
 
             # ---- Helper: apply style ----
-            from openpyxl.styles import Font, Alignment, Border, Side
-
             def apply_style(cell, row, style_rule):
                 if not style_rule:
                     return
@@ -142,7 +178,6 @@ class GenerateGlobalReport(Resource):
                     except:
                         continue
 
-            # ---- Helper: alignment dgn indent + wrap ----
             def get_alignment(align, wrap=False):
                 if align == "left":
                     return Alignment(horizontal="left", indent=1, wrapText=wrap, vertical="center")
@@ -159,7 +194,6 @@ class GenerateGlobalReport(Resource):
                     value = row.get(m["db_col"])
                     dtype = m["dtype"]
 
-                    # Format sesuai dtype
                     try:
                         if dtype == "currency":
                             value = float(value) if value is not None else 0
@@ -173,7 +207,6 @@ class GenerateGlobalReport(Resource):
                         elif dtype in ["float", "decimal"]:
                             value = float(value) if value is not None else 0
                             value = f"{m['prefix']}{value:,.2f}{m['suffix']}"
-
                         elif dtype == "date":
                             if isinstance(value, (datetime.datetime, datetime.date)):
                                 value = value.strftime("%d-%m-%Y")
@@ -202,19 +235,18 @@ class GenerateGlobalReport(Resource):
                         column=start_col_from + j - 1,
                         value=value
                     )
-
-                    # Alignment (pakai wrap & indent)
                     cell.alignment = get_alignment(m["align"], m["wraptext"])
-
-                    # Custom Style
                     apply_style(cell, row, m.get("style"))
 
-            # ---- Tambah border/gridline ----
+            # ---- Border tabel (skip tanda tangan) ----
             if data:
                 thin = Side(border_style="thin", color="000000")
                 border = Border(top=thin, left=thin, right=thin, bottom=thin)
                 last_row = start_row_from + len(data)
                 last_col = len(mapping)
+
+                sign_positions = {(r, c) for r, c, _, _ in sign_cells} if sign_cells else set()
+
                 for r in sheet_output.iter_rows(
                     min_row=start_row_from,
                     max_row=last_row,
@@ -222,24 +254,21 @@ class GenerateGlobalReport(Resource):
                     max_col=start_col_from + last_col - 1
                 ):
                     for cell in r:
-                        cell.border = border
+                        if (cell.row, cell.column) not in sign_positions:
+                            cell.border = border
 
-            # ---- Aggregate row (sum, avg, min, max, count) ----
+            # ---- Aggregate ----
             if data:
-                # cek apakah ada kolom aggregate di mapping
                 has_aggregate = any(m["aggregate"] for m in mapping)
-
                 if has_aggregate:
                     total_row_idx = start_row_from + len(data)
                     sheet_output.cell(row=total_row_idx, column=start_col_from, value="TOTAL").font = Font(bold=True)
-
                     for j, m in enumerate(mapping, start=1):
                         agg = m["aggregate"]
                         if not agg:
                             continue
                         try:
                             values = [float(row.get(m["db_col"]) or 0) for row in data]
-
                             if agg == "sum":
                                 agg_value = sum(values)
                             elif agg == "avg":
@@ -252,15 +281,12 @@ class GenerateGlobalReport(Resource):
                                 agg_value = len([v for v in values if v is not None])
                             else:
                                 agg_value = None
-
                             if agg_value is not None:
                                 cell = sheet_output.cell(
                                     row=total_row_idx,
                                     column=start_col_from + j - 1,
                                     value=agg_value
                                 )
-
-                                # Format ulang sesuai dtype
                                 if m["dtype"] == "currency":
                                     cell.value = f"{agg_value:,.0f}"
                                 elif m["dtype"] == "percent":
@@ -269,8 +295,6 @@ class GenerateGlobalReport(Resource):
                                     cell.value = int(agg_value)
                                 elif m["dtype"] in ["float", "decimal"]:
                                     cell.value = f"{agg_value:,.2f}"
-
-                                # Bold & align
                                 cell.font = Font(bold=True)
                                 cell.alignment = get_alignment(m["align"], m["wraptext"])
                         except Exception as e:
@@ -283,8 +307,6 @@ class GenerateGlobalReport(Resource):
                     del wb[s]
 
             out_type = (args.get("type") or "").strip().lower()
-
-            # fallback ke PDF kalau kosong, None, atau placeholder
             if not out_type or out_type in ["none", "[output_type]"]:
                 out_type = "pdf"
 
@@ -308,7 +330,7 @@ class GenerateGlobalReport(Resource):
                 wb.save(tmp_xlsx.name)
                 tmp_xlsx.close()
                 tmp_pdf = tmp_xlsx.name.replace(".xlsx", ".pdf")
-                soffice_path = r"C:\Program Files\LibreOffice\program\soffice.exe"
+                soffice_path = "soffice" if os.name != "nt" else r"C:\Program Files\LibreOffice\program\soffice.exe"
                 subprocess.run([soffice_path, "--headless", "--convert-to", "pdf",
                                 "--outdir", os.path.dirname(tmp_xlsx.name), tmp_xlsx.name], check=True)
 
@@ -323,7 +345,4 @@ class GenerateGlobalReport(Resource):
 
         except Exception as e:
             current_app.logger.error(e)
-            return {
-                "status": "error",
-                "message": str(e),
-            }, 500
+            return {"status": "error", "message": str(e)}, 500
