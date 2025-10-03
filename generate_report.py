@@ -1,0 +1,329 @@
+
+@api.route("/generate_report")
+class GenerateGlobalReport(Resource):
+    @doc.getSummaryRespDoc
+    def get(self):
+        try:
+            import os, io, subprocess, tempfile
+            import openpyxl
+            from flask import send_file, current_app, request
+            from openpyxl.styles import Font, Alignment, Border, Side
+            
+            args = parser.parse_args()
+
+            # --- Lokasi template ---
+            folder = 'app/static/format_report'
+            os.makedirs(folder, exist_ok=True)
+
+            file_name = request.args.get("file_name")
+            if not file_name:
+                return error_response("Parameter file_name wajib diisi", 400)
+
+            file_path = os.path.join(folder, file_name)
+            if not os.path.exists(file_path):
+                return error_response(f"File {file_name} tidak ditemukan di {folder}", 404)
+
+            # --- Load workbook ---
+            wb = openpyxl.load_workbook(file_path)
+            sheet_output = wb["Output"]
+            sheet_query = wb["Query"]
+            sheet_mapping = wb["Mapping"]
+
+            # ---- Baca query dari Sheet Query ----
+            query_parts, row_idx = [], 3
+            while True:
+                val = sheet_query.cell(row=row_idx, column=2).value
+                if not val:
+                    break
+                query_parts.append(str(val).strip())
+                row_idx += 1
+            query = " ".join(query_parts)
+
+            # ---- Ambil parameter dari client ----
+            params = dict(request.args)
+            body = request.get_json(silent=True) or {}
+            params.update(body)
+            params.pop("file_name", None)
+
+            # ---- Helper: safe_format (local function) ----
+            def safe_format(q, p):
+                class SafeDict(dict):
+                    def __missing__(self, key):
+                        return "NULL"  # literal NULL
+
+                    def __getitem__(self, key):
+                        val = dict.get(self, key)
+                        if val is None or str(val).lower() in ["none", "null", "undefined", ""]:
+                            return "NULL"  # pastikan NULL bukan 'NULL'
+                        if isinstance(val, (int, float)):
+                            return str(val)
+                        safe_val = str(val).replace("'", "''")
+                        return f"'{safe_val}'"
+
+                return q.format_map(SafeDict(p))
+
+            # ---- Format query aman ----
+            query = safe_format(query, params)
+            print(query)
+
+            # ---- Eksekusi query ----
+            result = db.session.execute(query)
+            columns = result.keys()
+            data = [dict(zip(columns, row)) for row in result.fetchall()]
+
+            # ---- Ambil start_row_from & start_col_from ----
+            start_row_from = 1
+            start_col_from = 1
+            if sheet_mapping["A1"].value and "start_row_from" in str(sheet_mapping["A1"].value):
+                start_row_from = int(sheet_mapping["B1"].value)
+            if sheet_mapping["A2"].value and "start_col_from" in str(sheet_mapping["A2"].value):
+                start_col_from = int(sheet_mapping["B2"].value)
+
+            # ---- Baca mapping (mulai dari row 4) ----
+            mapping = []
+            for row in sheet_mapping.iter_rows(min_row=4, values_only=True):
+                sheet_col, db_col, dtype, prefix, suffix, align, style, aggregate, wraptext = row + (None,) * (9 - len(row))
+                if not sheet_col:
+                    continue
+                mapping.append({
+                    "sheet_col": sheet_col,
+                    "db_col": db_col,
+                    "dtype": (dtype or "string").lower(),
+                    "prefix": prefix or "",
+                    "suffix": suffix or "",
+                    "align": (align or "left").lower(),
+                    "style": style or "",
+                    "aggregate": str(aggregate).lower() if aggregate else "",
+                    "wraptext": str(wraptext).strip() in ["1", "true", "yes", "y"]
+                })
+
+            # ---- Merge vars: params + row pertama query ----
+            data_first = data[0] if data else {}
+            merged_vars = {**params, **data_first}
+
+            # ---- Replace placeholder di Output ----
+            for row in sheet_output.iter_rows(values_only=False):
+                for cell in row:
+                    if cell.value and isinstance(cell.value, str) and "{" in cell.value:
+                        try:
+                            cell.value = cell.value.format(**merged_vars)
+                        except KeyError:
+                            cell.value = ""   # fallback kosong
+                        except Exception:
+                            pass
+
+            # ---- Helper: apply style ----
+            from openpyxl.styles import Font, Alignment, Border, Side
+
+            def apply_style(cell, row, style_rule):
+                if not style_rule:
+                    return
+                rules = [r.strip() for r in style_rule.split(",")]
+                for rule in rules:
+                    try:
+                        if rule == "bold":
+                            cell.font = Font(bold=True)
+                        elif rule == "italic":
+                            cell.font = Font(italic=True)
+                        elif rule == "underline":
+                            cell.font = Font(underline="single")
+                        elif rule.startswith("bold_if:"):
+                            cond = rule.split(":", 1)[1]
+                            if eval(str(row.get("level", 0)) + cond.replace("level", "")):
+                                cell.font = Font(bold=True)
+                        elif rule.startswith("red_if:"):
+                            cond = rule.split(":", 1)[1]
+                            if eval(str(cell.value) + cond):
+                                cell.font = Font(color="FF0000")
+                        elif rule.startswith("green_if:"):
+                            cond = rule.split(":", 1)[1]
+                            if eval(str(cell.value) + cond):
+                                cell.font = Font(color="00AA00")
+                    except:
+                        continue
+
+            # ---- Helper: alignment dgn indent + wrap ----
+            def get_alignment(align, wrap=False):
+                if align == "left":
+                    return Alignment(horizontal="left", indent=1, wrapText=wrap, vertical="center")
+                elif align == "right":
+                    return Alignment(horizontal="right", indent=1, wrapText=wrap, vertical="center")
+                elif align == "center":
+                    return Alignment(horizontal="center", wrapText=wrap, vertical="center")
+                else:
+                    return Alignment(horizontal="left", indent=1, wrapText=wrap, vertical="center")
+
+            # ---- Tulis data ----
+            for i, row in enumerate(data):
+                for j, m in enumerate(mapping, start=1):
+                    value = row.get(m["db_col"])
+                    dtype = m["dtype"]
+
+                    # Format sesuai dtype
+                    try:
+                        if dtype == "currency":
+                            value = float(value) if value is not None else 0
+                            value = f"{m['prefix']}{value:,.0f}{m['suffix']}"
+                        elif dtype == "percent":
+                            value = float(value) if value is not None else 0
+                            value = f"{value:.2f}{m['suffix']}"
+                        elif dtype in ["number", "int"]:
+                            value = int(value) if value is not None else 0
+                            value = f"{m['prefix']}{value}{m['suffix']}"
+                        elif dtype in ["float", "decimal"]:
+                            value = float(value) if value is not None else 0
+                            value = f"{m['prefix']}{value:,.2f}{m['suffix']}"
+
+                        elif dtype == "date":
+                            if isinstance(value, (datetime.datetime, datetime.date)):
+                                value = value.strftime("%d-%m-%Y")
+                            else:
+                                try:
+                                    value = datetime.datetime.fromisoformat(str(value)).strftime("%d-%m-%Y")
+                                except:
+                                    value = str(value) if value is not None else ""
+                        elif dtype == "datetime":
+                            if isinstance(value, (datetime.datetime, datetime.date)):
+                                value = value.strftime("%d-%m-%Y %H:%M:%S")
+                            else:
+                                try:
+                                    value = datetime.datetime.fromisoformat(str(value)).strftime("%d-%m-%Y %H:%M:%S")
+                                except:
+                                    value = str(value) if value is not None else ""
+                        elif dtype == "boolean":
+                            value = "Ya" if str(value).lower() in ["1", "true", "yes", "y"] else "Tidak"
+                        else:
+                            value = f"{m['prefix']}{value}{m['suffix']}" if value is not None else ""
+                    except:
+                        value = str(value) if value is not None else ""
+
+                    cell = sheet_output.cell(
+                        row=start_row_from + i,
+                        column=start_col_from + j - 1,
+                        value=value
+                    )
+
+                    # Alignment (pakai wrap & indent)
+                    cell.alignment = get_alignment(m["align"], m["wraptext"])
+
+                    # Custom Style
+                    apply_style(cell, row, m.get("style"))
+
+            # ---- Tambah border/gridline ----
+            if data:
+                thin = Side(border_style="thin", color="000000")
+                border = Border(top=thin, left=thin, right=thin, bottom=thin)
+                last_row = start_row_from + len(data)
+                last_col = len(mapping)
+                for r in sheet_output.iter_rows(
+                    min_row=start_row_from,
+                    max_row=last_row,
+                    min_col=start_col_from,
+                    max_col=start_col_from + last_col - 1
+                ):
+                    for cell in r:
+                        cell.border = border
+
+            # ---- Aggregate row (sum, avg, min, max, count) ----
+            if data:
+                # cek apakah ada kolom aggregate di mapping
+                has_aggregate = any(m["aggregate"] for m in mapping)
+
+                if has_aggregate:
+                    total_row_idx = start_row_from + len(data)
+                    sheet_output.cell(row=total_row_idx, column=start_col_from, value="TOTAL").font = Font(bold=True)
+
+                    for j, m in enumerate(mapping, start=1):
+                        agg = m["aggregate"]
+                        if not agg:
+                            continue
+                        try:
+                            values = [float(row.get(m["db_col"]) or 0) for row in data]
+
+                            if agg == "sum":
+                                agg_value = sum(values)
+                            elif agg == "avg":
+                                agg_value = sum(values) / len(values) if values else 0
+                            elif agg == "min":
+                                agg_value = min(values) if values else 0
+                            elif agg == "max":
+                                agg_value = max(values) if values else 0
+                            elif agg == "count":
+                                agg_value = len([v for v in values if v is not None])
+                            else:
+                                agg_value = None
+
+                            if agg_value is not None:
+                                cell = sheet_output.cell(
+                                    row=total_row_idx,
+                                    column=start_col_from + j - 1,
+                                    value=agg_value
+                                )
+
+                                # Format ulang sesuai dtype
+                                if m["dtype"] == "currency":
+                                    cell.value = f"{agg_value:,.0f}"
+                                elif m["dtype"] == "percent":
+                                    cell.value = f"{agg_value:.2f}"
+                                elif m["dtype"] in ["number", "int"]:
+                                    cell.value = int(agg_value)
+                                elif m["dtype"] in ["float", "decimal"]:
+                                    cell.value = f"{agg_value:,.2f}"
+
+                                # Bold & align
+                                cell.font = Font(bold=True)
+                                cell.alignment = get_alignment(m["align"], m["wraptext"])
+                        except Exception as e:
+                            current_app.logger.warning(f"Gagal aggregate kolom {m['db_col']}: {e}")
+                            continue
+
+            # ---- Hapus sheet selain Output ----
+            for s in wb.sheetnames:
+                if s != "Output":
+                    del wb[s]
+
+            out_type = (args.get("type") or "").strip().lower()
+
+            # fallback ke PDF kalau kosong, None, atau placeholder
+            if not out_type or out_type in ["none", "[output_type]"]:
+                out_type = "pdf"
+
+            if out_type == "xls":
+                output = io.BytesIO()
+                wb.save(output)
+                output.seek(0)
+                return send_file(output, as_attachment=True,
+                                 download_name="report.xlsx",
+                                 mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+            elif out_type == "pdf":
+                sheet_output.page_setup.fitToWidth = 1
+                sheet_output.page_setup.fitToHeight = 0
+                sheet_output.page_margins.left = 0.5
+                sheet_output.page_margins.right = 0.5
+                sheet_output.page_margins.top = 0.7
+                sheet_output.page_margins.bottom = 0.7
+
+                tmp_xlsx = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+                wb.save(tmp_xlsx.name)
+                tmp_xlsx.close()
+                tmp_pdf = tmp_xlsx.name.replace(".xlsx", ".pdf")
+                soffice_path = r"C:\Program Files\LibreOffice\program\soffice.exe"
+                subprocess.run([soffice_path, "--headless", "--convert-to", "pdf",
+                                "--outdir", os.path.dirname(tmp_xlsx.name), tmp_xlsx.name], check=True)
+
+                with open(tmp_pdf, "rb") as f:
+                    pdf_bytes = io.BytesIO(f.read())
+                os.remove(tmp_xlsx.name)
+                os.remove(tmp_pdf)
+
+                pdf_bytes.seek(0)
+                return send_file(pdf_bytes, as_attachment=True,
+                                 download_name="report.pdf", mimetype="application/pdf")
+
+        except Exception as e:
+            current_app.logger.error(e)
+            return {
+                "status": "error",
+                "message": str(e),
+            }, 500
