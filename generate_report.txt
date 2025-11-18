@@ -24,7 +24,7 @@ class GenerateHybridReport(Resource):
             # -----------------------------------------------------
             # Import engine V3
             # -----------------------------------------------------
-            from report_engine_v2 import generate_full_report
+
 
             # -----------------------------------------------------
             # 1) Generate FULL WORKBOOK via Engine V3
