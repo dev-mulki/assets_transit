@@ -49,7 +49,7 @@ def extract_sign_block(ws):
                 sign.append((
                     cell.row,
                     cell.column,
-                    raw_val,      # simpan teks asli
+                    raw_val,  # simpan teks asli
                     copy(cell.font),
                     copy(cell.alignment)
                 ))
@@ -60,7 +60,6 @@ def extract_sign_block(ws):
     return sign
 
 
-
 def get_alignment(align, wrap=False):
     align = (align or "left").lower()
     return Alignment(
@@ -69,6 +68,137 @@ def get_alignment(align, wrap=False):
         vertical="center",
         indent=1 if align == "left" else 0
     )
+
+
+from datetime import datetime, date
+
+
+def apply_cell_value(cell, val, m):
+    dtype = m["dtype"]
+    prefix = m["prefix"]
+    suffix = m["suffix"]
+
+    # ===============================
+    # STRING
+    # ===============================
+    if dtype == "string":
+        if val is None:
+            val = ""
+        cell.value = f"{prefix}{val}{suffix}"
+        return "string"
+
+    # ===============================
+    # INTEGER / NUMBER
+    # ===============================
+    if dtype in ["number", "int"]:
+        try:
+            v = int(val or 0)
+        except:
+            v = 0
+        cell.value = v
+        cell.number_format = "0"
+        return "number"
+
+    # ===============================
+    # FLOAT / DECIMAL
+    # ===============================
+    if dtype in ["float", "decimal"]:
+        try:
+            v = float(val or 0)
+        except:
+            v = 0.0
+        cell.value = v
+        cell.number_format = "0.00"
+        return "float"
+
+    # ===============================
+    # CURRENCY
+    # ===============================
+    if dtype == "currency":
+        try:
+            v = float(val or 0)
+        except:
+            v = 0.0
+
+        cell.value = v
+
+        # contoh: prefix "Rp. " → menjadi Excel:  "Rp. " #,##0
+        if prefix:
+            excel_fmt = f'"{prefix}"#,##0'
+        else:
+            excel_fmt = '#,##0'
+
+        cell.number_format = excel_fmt
+        return "currency"
+
+    # ===============================
+    # PERCENT (as Excel percent)
+    # input contoh: 83 → 83.00%
+    # ===============================
+    if dtype == "percent":
+        try:
+            v = float(val or 0) / 100
+        except:
+            v = 0.0
+
+        cell.value = v
+        cell.number_format = "0.00%"
+        return "percent"
+
+    # ===============================
+    # DATE
+    # ===============================
+    if dtype == "date":
+        dt = None
+        if isinstance(val, (datetime, date)):
+            dt = val
+        else:
+            try:
+                dt = datetime.strptime(str(val), "%Y-%m-%d")
+            except:
+                try:
+                    dt = datetime.strptime(str(val), "%d-%m-%Y")
+                except:
+                    dt = None
+
+        if dt:
+            cell.value = dt
+            cell.number_format = "DD-MM-YYYY"
+        else:
+            cell.value = ""
+        return "date"
+
+    # ===============================
+    # DATETIME
+    # ===============================
+    if dtype == "datetime":
+        dt = None
+        if isinstance(val, (datetime, date)):
+            dt = val
+        else:
+            try:
+                dt = datetime.fromisoformat(str(val))
+            except:
+                dt = None
+
+        if dt:
+            cell.value = dt
+            cell.number_format = "DD-MM-YYYY HH:MM:SS"
+        else:
+            cell.value = ""
+        return "datetime"
+
+    # ===============================
+    # BOOLEAN
+    # ===============================
+    if dtype == "boolean":
+        s = str(val).lower()
+        cell.value = "Ya" if s in ["1", "true", "yes", "y"] else "Tidak"
+        return "boolean"
+
+    # fallback
+    cell.value = val
+    return "string"
 
 
 def apply_style(cell, row, style_rule):
@@ -123,7 +253,7 @@ def extract_subreport_markers(sheet_output):
 # ================================================================
 #  CORE ENGINE: PROCESS SINGLE REPORT (TANPA SUBREPORT)
 # ================================================================
-def process_single_report(file_path, params):
+def process_single_report(file_path, params, is_sub=False):
     wb = openpyxl.load_workbook(file_path)
     sheet_output = wb["Output"]
     sheet_query = wb["Query"]
@@ -176,7 +306,6 @@ def process_single_report(file_path, params):
     # --------------------------
     subreport_markers = extract_subreport_markers(sheet_output)
 
-    print(subreport_markers)
     # ---- Geser tanda tangan (_sign) ----
     # --- Deteksi blok tanda tangan di template
     # --- Deteksi semua cell tanda tangan
@@ -202,96 +331,104 @@ def process_single_report(file_path, params):
                 except:
                     pass
 
-    # --------------------------
     # WRITE MAIN DATA
     # --------------------------
+    column_types = {}  # buat dipakai di aggregate
+
     for i, row in enumerate(data):
         for j, m in enumerate(mapping, start=1):
+
+            cell = sheet_output.cell(row=start_row + i, column=start_col + j - 1)
+
             val = row.get(m["db_col"])
-            dtype = m["dtype"]
+            col_type = apply_cell_value(cell, val, m)
 
-            try:
-                if dtype == "currency":
-                    val = float(val or 0)
-                    val = f"{m['prefix']}{val:,.0f}{m['suffix']}"
-                elif dtype == "percent":
-                    val = float(val or 0)
-                    val = f"{val:.2f}{m['suffix']}"
-                elif dtype in ["number", "int"]:
-                    val = int(val or 0)
-                elif dtype in ["float", "decimal"]:
-                    val = float(val or 0)
-                elif dtype == "date":
-                    if isinstance(val, (datetime.datetime, datetime.date)):
-                        val = val.strftime("%d-%m-%Y")
-                elif dtype == "datetime":
-                    if isinstance(val, (datetime.datetime, datetime.date)):
-                        val = val.strftime("%d-%m-%Y %H:%M:%S")
-                elif dtype == "boolean":
-                    val = "Ya" if str(val).lower() in ["1", "true", "yes", "y"] else "Tidak"
-            except:
-                val = val or ""
+            # simpan tipe kolom (dipakai aggregate)
+            if m["db_col"] not in column_types:
+                column_types[m["db_col"]] = col_type
 
-            c = sheet_output.cell(row=start_row + i, column=start_col + j - 1, value=val)
-            c.alignment = get_alignment(m["align"], m["wraptext"])
-            c.border = border_default
-            apply_style(c, row, m.get("style"))
+            # alignment & wrap
+            cell.alignment = get_alignment(m["align"], m["wraptext"])
 
-    # --------------------------
-    # AGGREGATE ROW
-    # --------------------------
+            # border
+            cell.border = border_default
+            apply_style(cell, row, m.get("style"))
+
+    # ===============================
+    # AGGREGATE (NEW)
+    # ===============================
     if data and any(m.get("aggregate") for m in mapping):
+
         total_row_idx = start_row + len(data)
-        sheet_output.cell(row=total_row_idx, column=start_col, value="TOTAL").font = Font(bold=True)
+
+        # label TOTAL
+        label_cell = sheet_output.cell(row=total_row_idx, column=start_col, value="TOTAL")
+        label_cell.font = Font(bold=True)
 
         for j, m in enumerate(mapping, start=1):
             agg = (m.get("aggregate") or "").strip().lower()
             if not agg:
                 continue
 
-            try:
-                values = []
-                for r in data:
-                    v = r.get(m["db_col"])
-                    if v is None:
-                        continue
-                    try:
-                        v = float(str(v).replace(",", "").replace("Rp", "").replace("%", ""))
-                        values.append(v)
-                    except:
-                        continue
+            db_col = m["db_col"]
+            col_type = column_types.get(db_col, "string")
 
-                agg_val = None
-                if agg == "sum":
-                    agg_val = sum(values)
-                elif agg == "avg":
-                    agg_val = sum(values) / len(values) if values else 0
-                elif agg == "min":
-                    agg_val = min(values) if values else 0
-                elif agg == "max":
-                    agg_val = max(values) if values else 0
-                elif agg == "count":
-                    agg_val = len(values)
+            # ambil nilai kolom
+            vals = []
+            for r in data:
+                raw = r.get(db_col)
+                if raw is None or raw == "":
+                    continue
 
-                if agg_val is not None:
-                    c = sheet_output.cell(row=total_row_idx, column=start_col + j - 1)
-                    dtype = m["dtype"]
+                # konversi sesuai tipe
+                try:
+                    if col_type in ["number", "int"]:
+                        vals.append(int(raw))
+                    elif col_type in ["float", "decimal", "currency", "percent"]:
+                        vals.append(float(str(raw).replace(",", "")))
+                except:
+                    continue
 
-                    if dtype == "currency":
-                        c.value = f"{agg_val:,.0f}"
-                    elif dtype == "percent":
-                        c.value = f"{agg_val:.2f}"
-                    elif dtype in ["float", "decimal"]:
-                        c.value = f"{agg_val:,.2f}"
-                    else:
-                        c.value = agg_val
+            # hitung aggregate
+            result = None
+            if agg == "sum":
+                result = sum(vals)
+            elif agg == "avg":
+                result = sum(vals) / len(vals) if vals else 0
+            elif agg == "min":
+                result = min(vals) if vals else 0
+            elif agg == "max":
+                result = max(vals) if vals else 0
+            elif agg == "count":
+                result = len(vals)
 
-                    c.font = Font(bold=True)
-                    c.alignment = get_alignment(m["align"], m["wraptext"])
-                    c.border = border_default
+            c = sheet_output.cell(row=total_row_idx, column=start_col + j - 1)
+            c.font = Font(bold=True)
+            c.border = border_default
+            c.alignment = get_alignment(m["align"], m["wraptext"])
 
-            except:
-                continue
+            # apply formatting sesuai tipe kolom
+            if col_type == "currency":
+                c.value = result
+                if m["prefix"]:
+                    c.number_format = f'"{m["prefix"]}"#,##0'
+                else:
+                    c.number_format = '#,##0'
+
+            elif col_type == "percent":
+                c.value = result / 100
+                c.number_format = "0.00%"
+
+            elif col_type in ["float", "decimal"]:
+                c.value = result
+                c.number_format = "0.00"
+
+            elif col_type in ["number", "int"]:
+                c.value = int(result)
+
+            else:
+                # fallback: string
+                c.value = result
 
         # === BORDER TOTAL (FIX LINE YANG HILANG DI ENGINE V3) ===
         last_col = start_col + len(mapping) - 1
@@ -342,13 +479,35 @@ def paste_sheet(main_ws, sub_ws, start_row, start_col=1):
             src = sub_ws.cell(row=r, column=c)
             dest = main_ws.cell(row=start_row + r - 1, column=start_col + c - 1)
 
+            # dest.value = src.value
+            #
+            # if src.has_style:
+            #     dest.font = copy(src.font)
+            #     dest.alignment = copy(src.alignment)
+            #     dest.border = copy(src.border)
+            #     dest.fill = copy(src.fill)
+
             dest.value = src.value
 
+            # Copy style dari subreport (hasil mapping)
             if src.has_style:
                 dest.font = copy(src.font)
                 dest.alignment = copy(src.alignment)
-                dest.border = copy(src.border)
-                dest.fill = copy(src.fill)
+
+                # Jangan timpa border kosong dengan border default
+                if src.border and src.border != Border():
+                    dest.border = copy(src.border)
+
+                # Fill ikut asalnya, tapi kalau kosong jangan timpa
+                if src.fill and src.fill != openpyxl.styles.PatternFill():
+                    dest.fill = copy(src.fill)
+
+                # 🔥🔥 WAJIB UNTUK FORMAT CURRENCY / PERCENT / DECIMAL
+                dest.number_format = src.number_format
+
+                # optional (tapi bagus)
+                dest.protection = copy(src.protection)
+                dest.quotePrefix = src.quotePrefix
 
     # Copy merged cells (FIX)
     for merged in sub_ws.merged_cells.ranges:
@@ -399,7 +558,7 @@ def shift_sign_after_merge(ws, start_row, total_main_rows, total_sub_rows):
 
     gap_sign = min_sign - (start_row + 1)
 
-    new_start = start_row + total_main_rows + total_sub_rows + gap_sign + 2
+    new_start = start_row + total_main_rows + total_sub_rows + gap_sign + 3
 
     for r, c, val, old_cell in sign_cells:
         offset = r - min_sign
@@ -413,6 +572,7 @@ def shift_sign_after_merge(ws, start_row, total_main_rows, total_sub_rows):
             new_cell.alignment = copy(old_cell.alignment)
 
         old_cell.value = None
+
 
 def place_sign_block(ws, sign_block, target_row, params):
     if not sign_block:
@@ -439,7 +599,6 @@ def place_sign_block(ws, sign_block, target_row, params):
         cell.alignment = align
 
 
-
 # ================================================================
 #  ENGINE V3: GENERATE FULL REPORT OTOMATIS
 # ================================================================
@@ -452,7 +611,7 @@ def generate_full_report(main_file, params):
 
     # 2️⃣ EXTRACT SIGN BLOCK sebelum apapun ditulis
     sign_block = extract_sign_block(main_ws)
-    main = process_single_report(main_path, params)
+    main = process_single_report(main_path, params, is_sub=False)
 
     # MERGE PARAMS + ROW DATA UTAMA (buat replace sign)
     merged_sign_params = dict(params)
@@ -467,16 +626,13 @@ def generate_full_report(main_file, params):
     total_main_rows = main["total_rows"]
     start_row_main = main["start_row"]
 
-
-    print(sign_block)
-
     markers = main["subreports"]
     total_sub_rows = 0
 
     # LOOP SUBREPORT
     for (marker_row, marker_col, subfile) in markers:
         sub_path = os.path.join(folder, subfile)
-        sub = process_single_report(sub_path, params)
+        sub = process_single_report(sub_path, params, is_sub=True)
 
         paste_row = calculate_offset(
             start_row_main,
@@ -491,7 +647,6 @@ def generate_full_report(main_file, params):
     # ⬇⬇⬇ TARUH SIGN KEMBALI DI BAWAH SUBREPORTS ⬇⬇⬇
     final_sign_row = start_row_main + total_main_rows + total_sub_rows + 2
     place_sign_block(main_ws, sign_block, final_sign_row, merged_sign_params)
-
 
     # FINAL SHIFT SIGN
     shift_sign_after_merge(
